@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: code-editor
+    env: python
+    buildCommand: "./build.sh"
+    startCommand: "daphne CodeEditor.asgi:application"
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: CodeEditor.settings
+      - key: PYTHON_VERSION
+        value: 3.11
