@@ -115,7 +115,10 @@ print("Sum:", a + b)</textarea>
     const errorsElem = document.getElementById("errors");
     const explanationElem = document.getElementById("explanation");
     const inputLineElem = document.getElementById("inputLine");
-    const socket = new WebSocket("ws://localhost:8000/ws/code/");
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const wsUrl = `${protocol}://${window.location.host}/ws/code/`;
+    const socket = new WebSocket(wsUrl);
+
 
     socket.onopen = () => {
       inputLineElem.disabled = false;
