@@ -4,12 +4,10 @@ import uuid
 import asyncio
 import urllib.parse
 from channels.generic.websocket import AsyncWebsocketConsumer
-import docker  # Fixed import here
+import docker
 
-# Import your OpenAI client as you do in views
 from editor.views import OpenAI
 
-# Initialize your OpenAI client with your base_url and api_key
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key="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"
@@ -18,18 +16,36 @@ client = OpenAI(
 class CodeRunConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         await self.accept()
-        self.docker_client = docker.from_env()  # Correct usage here
+        self.docker_client = docker.from_env()
         self.container = None
-        self.socket = None
         self.output_task = None
+        self.output_queue = asyncio.Queue()
+        self.reading_task = None
 
     async def disconnect(self, close_code):
         if self.output_task:
             self.output_task.cancel()
-        if self.socket:
-            self.socket.close()
+            try:
+                await self.output_task
+            except asyncio.CancelledError:
+                pass
+        
+        if self.reading_task:
+            self.reading_task.cancel()
+            try:
+                await self.reading_task
+            except asyncio.CancelledError:
+                pass
+        
         if self.container:
-            self.container.remove(force=True)
+            try:
+                self.container.kill()
+            except Exception:
+                pass
+            try:
+                self.container.remove(force=True)
+            except Exception:
+                pass
 
     async def receive(self, text_data):
         data = json.loads(text_data)
@@ -42,12 +58,19 @@ class CodeRunConsumer(AsyncWebsocketConsumer):
             temp_dir = os.path.join(os.getcwd(), "temp_runs", run_id)
             os.makedirs(temp_dir, exist_ok=True)
 
-            # Write user code to user_code.py
             user_code_path = os.path.join(temp_dir, "user_code.py")
             with open(user_code_path, "w") as f:
                 f.write(code)
 
-            # Run container with user_code.py
+            # Remove previous container if any
+            if self.container:
+                try:
+                    self.container.kill()
+                    self.container.remove(force=True)
+                except Exception:
+                    pass
+
+            # Run the container
             self.container = self.docker_client.containers.run(
                 image="python-runner",
                 volumes={temp_dir: {"bind": "/app", "mode": "rw"}},
@@ -56,24 +79,25 @@ class CodeRunConsumer(AsyncWebsocketConsumer):
                 stdin_open=True,
                 tty=True,
                 detach=True,
+                stream=True,
             )
 
-            self.socket = self.container.attach_socket(
-                params={'stdin': 1, 'stdout': 1, 'stderr': 1, 'stream': 1}
-            )
+            # Attach to the container's socket stream (stdout + stderr)
+            # Use logs(stream=True) as simpler alternative for output streaming
+            self.output_task = asyncio.create_task(self.stream_container_logs())
 
-            self.output_task = asyncio.create_task(self.stream_output())
-
+            # Send user input lines to container stdin (via exec)
             for line in user_input.splitlines():
                 await self.send_input(line)
 
-            # After container starts, generate AI explanation and Python Tutor URL
+            # Generate AI explanation
             ai_explanation = await self.get_ai_explanation(code)
             await self.send(text_data=json.dumps({
                 "type": "ai_explanation",
                 "content": ai_explanation
             }))
 
+            # Send Python Tutor visualization URL
             python_tutor_url = self.get_python_tutor_visual(code)
             await self.send(text_data=json.dumps({
                 "type": "python_tutor_visual",
@@ -84,26 +108,47 @@ class CodeRunConsumer(AsyncWebsocketConsumer):
             await self.send_input(data["input"])
 
     async def send_input(self, input_line):
-        to_send = (input_line + "\n").encode('utf-8')
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.socket.send, to_send)
+        if not self.container:
+            await self.send(text_data=json.dumps({"type": "error", "message": "Container not running."}))
+            return
 
-    async def stream_output(self):
+        # Use docker exec to send input into running container's stdin
+        # docker-py doesn't expose direct stdin write on container object easily,
+        # so one way: create an exec instance attached to stdin and send data
+
         loop = asyncio.get_running_loop()
         try:
-            while True:
-                output = await loop.run_in_executor(None, self.socket.recv, 1024)
-                if not output:
-                    break
-                decoded = output.decode('utf-8', errors='ignore')
+            exec_instance = self.docker_client.api.exec_create(
+                container=self.container.id,
+                cmd=['/bin/sh', '-c', f'echo "{input_line}" >> /dev/stdin'],
+                stdin=True,
+                tty=True,
+            )
+            await loop.run_in_executor(
+                None,
+                self.docker_client.api.exec_start,
+                exec_instance['Id'],
+                detach=False,
+                tty=True,
+                stream=False,
+            )
+        except Exception as e:
+            await self.send(text_data=json.dumps({"type": "error", "message": f"Error sending input: {str(e)}"}))
+
+    async def stream_container_logs(self):
+        # Stream container logs (stdout + stderr) asynchronously
+        try:
+            for log in self.container.logs(stream=True, stdout=True, stderr=True, follow=True):
+                decoded = log.decode('utf-8', errors='ignore')
                 await self.send(text_data=json.dumps({"type": "output", "output": decoded}))
         except asyncio.CancelledError:
             pass
+        except Exception as e:
+            await self.send(text_data=json.dumps({"type": "error", "message": f"Log streaming error: {str(e)}"}))
 
     async def get_ai_explanation(self, code):
         prompt = f"Explain this Python code in simple terms:\n\n{code}\n\nExplanation:"
         try:
-            # openrouter.ai's OpenAI client usage — assuming async await possible, else wrap sync call in asyncio.to_thread
             completion = await asyncio.to_thread(
                 client.chat.completions.create,
                 model="gpt-4o-mini",
