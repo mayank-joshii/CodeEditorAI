@@ -4,7 +4,7 @@ import uuid
 import asyncio
 import urllib.parse
 from channels.generic.websocket import AsyncWebsocketConsumer
-from docker import from_env as docker_from_env
+import docker  # Fixed import here
 
 # Import your OpenAI client as you do in views
 from editor.views import OpenAI
@@ -18,7 +18,7 @@ client = OpenAI(
 class CodeRunConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         await self.accept()
-        self.docker_client = docker_from_env()
+        self.docker_client = docker.from_env()  # Correct usage here
         self.container = None
         self.socket = None
         self.output_task = None
